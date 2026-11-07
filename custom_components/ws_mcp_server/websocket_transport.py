@@ -17,7 +17,7 @@ except ImportError:  # pragma: no cover - mcp 1.x fallback
 
 from homeassistant.components import conversation
 from homeassistant.const import CONF_LLM_HASS_API
-from homeassistant.core import HomeAssistant
+from homeassistant.core import Context, HomeAssistant
 from homeassistant.helpers import llm
 
 from .const import DOMAIN
@@ -102,12 +102,16 @@ async def _connect_to_client(
     if not endpoint:
         raise RuntimeError("No client endpoint configured in config entry")
 
-    _LOGGER.info("mcp connecting to MCP client at: %s", endpoint)
+    _LOGGER.info("mcp connecting to configured MCP client")
     _set_status(hass, entry, "connecting")
 
+    # This outbound integration exposes the APIs selected by the administrator.
+    # Use a real HA user context so API authorization and service calls can read
+    # user_id; a dict is not a valid Context even when it is empty.
+    owner = await hass.auth.async_get_owner()
     context = llm.LLMContext(
         platform=DOMAIN,
-        context={},
+        context=Context(user_id=owner.id) if owner else Context(),
         language="*",
         assistant=conversation.DOMAIN,
         device_id=None,

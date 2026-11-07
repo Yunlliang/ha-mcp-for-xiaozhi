@@ -13,6 +13,7 @@ import anyio
 from mcp import ClientSession, types
 
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.core import Context
 from homeassistant.helpers import llm
 
 from custom_components.ws_mcp_server.server import (
@@ -20,7 +21,10 @@ from custom_components.ws_mcp_server.server import (
     SNAPSHOT_RESOURCE_URI,
     create_server,
 )
-from custom_components.ws_mcp_server.websocket_transport import _parse_jsonrpc_message
+from custom_components.ws_mcp_server.websocket_transport import (
+    _connect_to_client,
+    _parse_jsonrpc_message,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,7 +43,7 @@ class ServerCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             return_value=self.api,
         ))
         self.context = llm.LLMContext(
-            platform="ws_mcp_server", context={}, language="en",
+            platform="ws_mcp_server", context=Context(), language="en",
             assistant="conversation", device_id=None,
         )
         self.server = await create_server(None, "assist", self.context, read_only=False)
@@ -130,6 +134,61 @@ class ServerCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                     json.loads(message.model_dump_json(by_alias=True, exclude_none=True)),
                     payload,
                 )
+
+    async def test_transport_creates_home_assistant_user_context(self):
+        for owner in (SimpleNamespace(id="owner-1"), None):
+            with self.subTest(owner=owner):
+                hass = SimpleNamespace(
+                    auth=SimpleNamespace(async_get_owner=AsyncMock(return_value=owner)),
+                    states=SimpleNamespace(async_set=lambda *args: None),
+                )
+                entry = SimpleNamespace(
+                    runtime_data=None, entry_id="test",
+                    data={"client_endpoint": "wss://example.invalid/?token=private",
+                          "llm_hass_api": ["assist"]},
+                )
+                # Stop at server construction, before opening a network connection.
+                with patch(
+                    "custom_components.ws_mcp_server.websocket_transport.create_server",
+                    new_callable=AsyncMock, side_effect=RuntimeError("captured context"),
+                ) as factory:
+                    with self.assertLogs(
+                        "custom_components.ws_mcp_server.websocket_transport", level="INFO"
+                    ) as logs:
+                        with self.assertRaisesRegex(RuntimeError, "captured context"):
+                            await _connect_to_client(hass, entry)
+                context = factory.call_args.args[2]
+                self.assertIsInstance(context.context, Context)
+                self.assertEqual(context.context.user_id, owner.id if owner else None)
+                self.assertNotIn("private", "\n".join(logs.output))
+
+    async def test_transport_context_passes_real_home_assistant_authorization(self):
+        """Exercise HA's real admin check instead of mocking async_get_api."""
+        owner = SimpleNamespace(id="owner-1", is_admin=True)
+        hass = SimpleNamespace(
+            auth=SimpleNamespace(
+                async_get_owner=AsyncMock(return_value=owner),
+                async_get_user=AsyncMock(return_value=owner),
+            ),
+            states=SimpleNamespace(async_set=lambda *args: None),
+        )
+        entry = SimpleNamespace(runtime_data=None, entry_id="test", data={
+            "client_endpoint": "wss://example.invalid/", "llm_hass_api": ["assist"]
+        })
+        with patch(
+            "custom_components.ws_mcp_server.websocket_transport.create_server",
+            new_callable=AsyncMock, side_effect=RuntimeError("captured context"),
+        ) as factory:
+            with self.assertRaisesRegex(RuntimeError, "captured context"):
+                await _connect_to_client(hass, entry)
+        context = factory.call_args.args[2]
+        api = SimpleNamespace(
+            requires_admin=True, hass=hass, async_get_api_instance=AsyncMock(return_value=self.api)
+        )
+        result = await llm.async_get_authorized_api_instance(api, context)
+        self.assertIs(result, self.api)
+        hass.auth.async_get_user.assert_awaited_once_with(owner.id)
+        api.async_get_api_instance.assert_awaited_once_with(context)
 
     async def test_real_sdk_handshake_and_requests(self):
         """Negotiate and exchange requests using real client/server sessions."""
