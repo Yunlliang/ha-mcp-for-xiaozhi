@@ -1,6 +1,9 @@
 name: Upload ZIP to Release
 
 on:
+  push:
+    tags:
+      - 'v*'
   release:
     types: [created]  # 当创建 Release 时触发
 permissions:
@@ -53,13 +56,22 @@ jobs:
           echo "ZIP file contents:"
           unzip -l ha-mcp-for-xiaozhi.zip
           
+      # Tags publish a release so HACS can discover the update.
+      - name: Create release for tag
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ steps.get_version.outputs.TAG_NAME }}
+        run: |
+          if ! gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release create "$TAG_NAME" --verify-tag --title "$TAG_NAME" --generate-notes
+          fi
+
       # 3. 上传 ZIP 到 Release
       - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: ./ha-mcp-for-xiaozhi.zip
-          asset_name: ha-mcp-for-xiaozhi.zip
-          asset_content_type: application/zip
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ steps.get_version.outputs.TAG_NAME }}
+        run: gh release upload "$TAG_NAME" ha-mcp-for-xiaozhi.zip --clobber
